@@ -350,7 +350,7 @@ __global__ void fusedBuildExpertMapsSortFirstTokenKernel(
 
 // We are done with compute, launch the dependent kernels while the stores are in flight
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  //asm volatile("griddepcontrol.launch_dependents;");
 #endif
 
   // write to shared memory and global memory
@@ -359,8 +359,17 @@ __global__ void fusedBuildExpertMapsSortFirstTokenKernel(
     for (int i = 0; i < EXPERTS_PER_TOKEN; i++) {
       int const unpermuted_row = i * num_tokens + token;
       int const permuted_row = local_token_permuted_indices[i];
+      //printf("input_row: %i unpermuted_row: %i expert_i: %i local_token_selected_experts[i]: %i permuted_row: %i\n", token, unpermuted_row, i, local_token_selected_experts[i], permuted_row);
       permuted_row_to_unpermuted_row[permuted_row] = unpermuted_row;
       unpermuted_row_to_permuted_row[unpermuted_row] = permuted_row;
+    }
+  }
+
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    for (int i = 0; i < num_tokens * EXPERTS_PER_TOKEN; i++) {
+      //printf("i: %i, unpermuted_row_to_permuted_row[i]: %i\n", i, unpermuted_row_to_permuted_row[i]);
     }
   }
 
@@ -1334,6 +1343,8 @@ constexpr int EXPAND_ELEMS_PER_THREAD_NVFP4 = 64;
 
 __global__ void expandInputRowsKernel_nvfp4(uint64_t const* __restrict__ unpermuted_input,
                                             uint64_t* __restrict__ permuted_output,
+                                            float const* unpermuted_scales,
+                                            float *permuted_scales,
                                             int const *unpermuted_row_to_permuted_row,
                                             int64_t const num_tokens, int64_t const hidden_size, int64_t const experts_per_token, int64_t const * __restrict__ expert_first_token_offset, int const * __restrict__ token_selected_experts, int const num_experts_per_node,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
@@ -1394,7 +1405,7 @@ __global__ void expandInputRowsKernel_nvfp4(uint64_t const* __restrict__ unpermu
       for (int k = 0; k < inputs_per_thread; k++) {
         int idx = EXPAND_THREADS_PER_BLOCK_NVFP4 * k + threadIdx.x;
         if (threadIdx.x == 0 && k == 0) {
-          printf("input_row: %i expert_i: %i expert: %i output_row: %i permuted_output: %llu inputs[k]: %llu\n", input_row, i, target_expert, output_row, permuted_output[output_row * inputs_per_row + idx], inputs[k]);
+          //printf("input_row: %i unpermuted_row: %i expert_i: %i expert: %i output_row: %i permuted_output: %llu inputs[k]: %llu\n", input_row, input_row + i * (int)num_tokens, i, target_expert, output_row, permuted_output[output_row * inputs_per_row + idx], inputs[k]);
         }
         if (idx < inputs_per_row) {
           permuted_output[output_row * inputs_per_row + idx] = inputs[k];
@@ -1406,17 +1417,22 @@ __global__ void expandInputRowsKernel_nvfp4(uint64_t const* __restrict__ unpermu
         int sf_linear = EXPAND_THREADS_PER_BLOCK_NVFP4 * k + threadIdx.x;
         if (sf_linear * 16 < hidden_size) {
           int num_tokens_before_expert = expert_first_token_offset[target_expert];
-          //int act_sf_expert = getOffsetActivationSF(target_expert, num_tokens_before_expert, hidden_size,
-           //                                         TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4);
-          int output_offset = get_sf_out_offset_128x4(std::nullopt, output_row - num_tokens_before_expert, sf_linear * 16, std::nullopt,
-                                                  hidden_size / 16);
+          int act_sf_expert = getOffsetActivationSF(target_expert, num_tokens_before_expert, hidden_size,
+                                                    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4);
+          //int output_offset = act_sf_expert + get_sf_out_offset_128x4(std::nullopt, output_row - num_tokens_before_expert, sf_linear * 16, std::nullopt,
+                                                  //hidden_size / 16);
+          int output_offset = act_sf_expert + get_sf_out_offset_128x4(std::nullopt, output_row - num_tokens_before_expert, sf_linear, std::nullopt, hidden_size / 16);
  
-          if (threadIdx.x == 0) {
-            printf("input_row: %i, target_expert: %i output_row: %i, output_offset: %i, fc1_act_sf_flat: %i, input_sfs: %i, linear_sf: %i, num_tokens_before_expert: %i\n",
-                    input_row, target_expert, output_row, output_offset, (int)fc1_act_sf_flat[output_offset], (int)input_sfs[k], sf_linear, num_tokens_before_expert);
-          }
-          //fc1_act_sf_flat[output_offset] = input_sfs[k];
+          //if (threadIdx.x == 0) {
+          //printf("threadIdx.x: %i input_row: %i, target_expert: %i output_row: %i, output_offset: %i, fc1_act_sf_flat: %i, input_sfs: %i, linear_sf: %i, num_tokens_before_expert: %i\n",
+             //       threadIdx.x, input_row, target_expert, output_row, output_offset, (int)fc1_act_sf_flat[output_offset], (int)input_sfs[k], sf_linear, num_tokens_before_expert);
+          //}
+          fc1_act_sf_flat[output_offset] = input_sfs[k];
         }
+      }
+
+      if (permuted_scales && threadIdx.x == 0) {
+        permuted_scales[output_row] = unpermuted_scales ? unpermuted_scales[input_row * experts_per_token + i] : 1.0f;
       }
     }
   }
@@ -1554,10 +1570,10 @@ __global__ void expandInputRowsKernel(
         } else {
           assert(act_scale_idx == 0 &&
                  "Cannot use per-expert act scale for pre-quantized activations");
-          writeSF<VecSize, ELEM_PER_THREAD>(num_tokens_before_expert, expert, source_row,
-                                            permuted_row, elem_index, padded_hidden_size,
-                                            fc1_act_sf_flat, input_sf, swizzled_input_sf);
           if constexpr (!SCALES_ONLY) {
+            writeSF<VecSize, ELEM_PER_THREAD>(num_tokens_before_expert, expert, source_row,
+                                              permuted_row, elem_index, padded_hidden_size,
+                                              fc1_act_sf_flat, input_sf, swizzled_input_sf);
             dest_row_ptr[elem_index] = in_vec;
           }
         }
@@ -1738,16 +1754,18 @@ void expandInputRowsKernelLauncher(
   if constexpr (std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1> && std::is_same_v<InputActivationsType, __nv_fp4_e2m1>) {
     if (hidden_size % 64 == 0 && hidden_size < EXPAND_THREADS_PER_BLOCK_NVFP4 * EXPAND_ELEMS_PER_THREAD_NVFP4) {
 
-      cudaLaunchKernelEx(&config, &expandInputRowsKernel<__nv_fp4_e2m1, __nv_fp4_e2m1, TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4, /*PRE_QUANT_AWQ=*/false, /*SCALES_ONLY=*/false>, unpermuted_input, permuted_output, unpermuted_scales,
-                         permuted_scales, permuted_row_to_unpermuted_row, num_rows, hidden_size, k,
-                         quant_params.fp4.fc1.act_global_scale, use_per_expert_act_scale,
-                         expert_first_token_offset, fc1_act_sf_flat, input_sf, swizzled_input_sf,
-                         num_experts_per_node,
-                         reinterpret_cast<InputActivationsType const*>(prequant_scales));
+      //cudaLaunchKernelEx(&config, &expandInputRowsKernel<__nv_fp4_e2m1, __nv_fp4_e2m1, TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4, /*PRE_QUANT_AWQ=*/false, /*SCALES_ONLY=*/true>, unpermuted_input, permuted_output, unpermuted_scales,
+      //                   permuted_scales, permuted_row_to_unpermuted_row, num_rows, hidden_size, k,
+      //                   quant_params.fp4.fc1.act_global_scale, use_per_expert_act_scale,
+      //                   expert_first_token_offset, fc1_act_sf_flat, input_sf, swizzled_input_sf,
+      //                   num_experts_per_node,
+      //                   reinterpret_cast<InputActivationsType const*>(prequant_scales));
 
       expandInputRowsKernel_nvfp4<<<num_rows, EXPAND_THREADS_PER_BLOCK_NVFP4, 0, stream>>>(
         reinterpret_cast<uint64_t const*>(unpermuted_input),
         reinterpret_cast<uint64_t*>(permuted_output),
+        unpermuted_scales,
+        permuted_scales,
         unpermuted_row_to_permuted_row,
         num_rows,
         hidden_size,
@@ -3874,6 +3892,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     if (!use_w4_groupwise) {
       // WAR: fusedBuildExpertMapsSortFirstToken kernel will lead to illegal memory access for
       // W4AFP8
+      //std::cout << "calling fused build" << std::endl;
       fused_prologue_result = fusedBuildExpertMapsSortFirstToken(
           token_selected_experts, permuted_row_to_unpermuted_row_, unpermuted_row_to_permuted_row,
           expert_first_token_offset_, num_rows, num_experts_per_node, experts_per_token,
@@ -3894,6 +3913,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     bool is_gated_activation = isGatedActivation(fc1_activation_type);
 
     if (use_lora) {
+      std::cout << "Use lora" << std::endl;
       std::vector<int>& host_permuted_rows = host_lora_workspace_.host_permuted_rows;
       std::vector<int64_t>& host_expert_first_token_offset =
           host_lora_workspace_.host_expert_first_token_offset;
@@ -3918,7 +3938,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         experts_per_token, num_experts_per_node, quant_params, use_per_expert_act_scale,
         expert_first_token_offset_, fc1_fp4_act_scale_, input_sf, swizzled_input_sf,
         (use_w4afp8 && !use_fp8_input) ? quant_params.groupwise.fc1.act_scales : nullptr,
-        enable_pdl, permuted_row_to_unpermuted_row_, token_selected_experts, stream);
+        enable_pdl, unpermuted_row_to_permuted_row, token_selected_experts, stream);
     auto const* gemm1_input = gemm1_input_expand;
 
     sync_check_cuda_error(stream);

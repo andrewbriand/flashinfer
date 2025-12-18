@@ -1335,14 +1335,30 @@ constexpr int EXPAND_ELEMS_PER_THREAD_NVFP4 = 64;
 __global__ void expandInputRowsKernel_nvfp4(uint64_t const* __restrict__ unpermuted_input,
                                             uint64_t* __restrict__ permuted_output,
                                             int const *unpermuted_row_to_permuted_row,
-                                            int64_t const num_tokens, int64_t const hidden_size, int64_t const experts_per_token, int64_t const * __restrict__ expert_first_token_offset, int const * __restrict__ token_selected_experts, int const num_experts_per_node) {
+                                            int64_t const num_tokens, int64_t const hidden_size, int64_t const experts_per_token, int64_t const * __restrict__ expert_first_token_offset, int const * __restrict__ token_selected_experts, int const num_experts_per_node,
+    TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
+    TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, bool const swizzled_input_sf) {
 
   constexpr int elems_per_input = 64 / 4;
   constexpr int inputs_per_thread = EXPAND_ELEMS_PER_THREAD_NVFP4 / elems_per_input;
+
+  constexpr int elem_per_thread_for_write_sf = 8;
+  constexpr int vec_size_for_write_sf = 16;
+
+  constexpr int sf_per_thread = EXPAND_ELEMS_PER_THREAD_NVFP4 / 16;
+
   uint64_t inputs[inputs_per_thread];
+  uint8_t input_sfs[sf_per_thread];
+  
 
   int input_row = blockIdx.x;
   int inputs_per_row = hidden_size / elems_per_input;
+
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    for (int i = 0; i < num_tokens; i++) {
+      //printf("input_row: %i, unpermuted_row_to_permuted_row: %i\n", i, unpermuted_row_to_permuted_row[i]
+    }
+  }
 
   int row_start = input_row * inputs_per_row; 
 
@@ -1354,6 +1370,22 @@ __global__ void expandInputRowsKernel_nvfp4(uint64_t const* __restrict__ unpermu
     }
   }
 
+  #pragma unroll
+  for (int k = 0; k < sf_per_thread; k++) {
+    int sf_linear = EXPAND_THREADS_PER_BLOCK_NVFP4 * k + threadIdx.x;
+    if (sf_linear * 16 < hidden_size) {
+      int offset;
+      if (swizzled_input_sf) {
+        offset = get_sf_out_offset_128x4(0, input_row, sf_linear, num_tokens, hidden_size / 16);
+      } else {
+        offset = input_row * hidden_size / 16 + sf_linear;
+      }
+
+      input_sfs[k] = input_sf[offset];
+    }
+  }
+
+
   for (int i = 0; i < experts_per_token; i++) {
     int output_row = unpermuted_row_to_permuted_row[input_row + i * num_tokens];
     int target_expert = token_selected_experts[input_row * experts_per_token + i];
@@ -1361,11 +1393,29 @@ __global__ void expandInputRowsKernel_nvfp4(uint64_t const* __restrict__ unpermu
       #pragma unroll
       for (int k = 0; k < inputs_per_thread; k++) {
         int idx = EXPAND_THREADS_PER_BLOCK_NVFP4 * k + threadIdx.x;
-        //if (threadIdx.x == 0 && k == 0) {
-        //  printf("input_row: %i expert_i: %i expert: %i output_row: %i permuted_output: %llu inputs[k]: %llu\n", input_row, i, target_expert, output_row, permuted_output[output_row * inputs_per_row + idx], inputs[k]);
-        //}
+        if (threadIdx.x == 0 && k == 0) {
+          printf("input_row: %i expert_i: %i expert: %i output_row: %i permuted_output: %llu inputs[k]: %llu\n", input_row, i, target_expert, output_row, permuted_output[output_row * inputs_per_row + idx], inputs[k]);
+        }
         if (idx < inputs_per_row) {
           permuted_output[output_row * inputs_per_row + idx] = inputs[k];
+        }
+      }
+
+      #pragma unroll
+      for (int k = 0; k < sf_per_thread; k++) {
+        int sf_linear = EXPAND_THREADS_PER_BLOCK_NVFP4 * k + threadIdx.x;
+        if (sf_linear * 16 < hidden_size) {
+          int num_tokens_before_expert = expert_first_token_offset[target_expert];
+          //int act_sf_expert = getOffsetActivationSF(target_expert, num_tokens_before_expert, hidden_size,
+           //                                         TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4);
+          int output_offset = get_sf_out_offset_128x4(std::nullopt, output_row - num_tokens_before_expert, sf_linear * 16, std::nullopt,
+                                                  hidden_size / 16);
+ 
+          if (threadIdx.x == 0) {
+            printf("input_row: %i, target_expert: %i output_row: %i, output_offset: %i, fc1_act_sf_flat: %i, input_sfs: %i, linear_sf: %i, num_tokens_before_expert: %i\n",
+                    input_row, target_expert, output_row, output_offset, (int)fc1_act_sf_flat[output_offset], (int)input_sfs[k], sf_linear, num_tokens_before_expert);
+          }
+          //fc1_act_sf_flat[output_offset] = input_sfs[k];
         }
       }
     }
@@ -1686,9 +1736,9 @@ void expandInputRowsKernelLauncher(
 
   
   if constexpr (std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1> && std::is_same_v<InputActivationsType, __nv_fp4_e2m1>) {
-    if (hidden_size % 16 == 0 && hidden_size < EXPAND_THREADS_PER_BLOCK_NVFP4 * EXPAND_ELEMS_PER_THREAD_NVFP4) {
+    if (hidden_size % 64 == 0 && hidden_size < EXPAND_THREADS_PER_BLOCK_NVFP4 * EXPAND_ELEMS_PER_THREAD_NVFP4) {
 
-      cudaLaunchKernelEx(&config, &expandInputRowsKernel<__nv_fp4_e2m1, __nv_fp4_e2m1, TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4, /*PRE_QUANT_AWQ=*/false, /*SCALES_ONLY=*/true>, unpermuted_input, permuted_output, unpermuted_scales,
+      cudaLaunchKernelEx(&config, &expandInputRowsKernel<__nv_fp4_e2m1, __nv_fp4_e2m1, TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4, /*PRE_QUANT_AWQ=*/false, /*SCALES_ONLY=*/false>, unpermuted_input, permuted_output, unpermuted_scales,
                          permuted_scales, permuted_row_to_unpermuted_row, num_rows, hidden_size, k,
                          quant_params.fp4.fc1.act_global_scale, use_per_expert_act_scale,
                          expert_first_token_offset, fc1_act_sf_flat, input_sf, swizzled_input_sf,
@@ -1704,7 +1754,10 @@ void expandInputRowsKernelLauncher(
         k,
         expert_first_token_offset,
         token_selected_experts,
-        num_experts_per_node);
+        num_experts_per_node,
+        fc1_act_sf_flat,
+        input_sf,
+        swizzled_input_sf);
 
       return;
     }

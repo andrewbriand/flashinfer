@@ -1329,6 +1329,49 @@ __host__ __device__ constexpr static U arrayConvert(T const& input) {
   return converter(input);
 }
 
+constexpr int EXPAND_THREADS_PER_BLOCK_NVFP4 = 128;
+constexpr int EXPAND_ELEMS_PER_THREAD_NVFP4 = 64;
+
+__global__ void expandInputRowsKernel_nvfp4(uint64_t const* __restrict__ unpermuted_input,
+                                            uint64_t* __restrict__ permuted_output,
+                                            int const *unpermuted_row_to_permuted_row,
+                                            int64_t const num_tokens, int64_t const hidden_size, int64_t const experts_per_token, int64_t const * __restrict__ expert_first_token_offset, int const * __restrict__ token_selected_experts, int const num_experts_per_node) {
+
+  constexpr int elems_per_input = 64 / 4;
+  constexpr int inputs_per_thread = EXPAND_ELEMS_PER_THREAD_NVFP4 / elems_per_input;
+  uint64_t inputs[inputs_per_thread];
+
+  int input_row = blockIdx.x;
+  int inputs_per_row = hidden_size / elems_per_input;
+
+  int row_start = input_row * inputs_per_row; 
+
+  #pragma unroll
+  for (int k = 0; k < inputs_per_thread; k++) {
+    int idx = EXPAND_THREADS_PER_BLOCK_NVFP4 * k + threadIdx.x;
+    if (idx < inputs_per_row) {
+      inputs[k] = unpermuted_input[row_start + idx];
+    }
+  }
+
+  for (int i = 0; i < experts_per_token; i++) {
+    int output_row = unpermuted_row_to_permuted_row[input_row + i * num_tokens];
+    int target_expert = token_selected_experts[input_row * experts_per_token + i];
+    if (target_expert >= 0 && target_expert < num_experts_per_node) {
+      #pragma unroll
+      for (int k = 0; k < inputs_per_thread; k++) {
+        int idx = EXPAND_THREADS_PER_BLOCK_NVFP4 * k + threadIdx.x;
+        //if (threadIdx.x == 0 && k == 0) {
+        //  printf("input_row: %i expert_i: %i expert: %i output_row: %i permuted_output: %llu inputs[k]: %llu\n", input_row, i, target_expert, output_row, permuted_output[output_row * inputs_per_row + idx], inputs[k]);
+        //}
+        if (idx < inputs_per_row) {
+          permuted_output[output_row * inputs_per_row + idx] = inputs[k];
+        }
+      }
+    }
+  }
+}
+
 // Duplicated and permutes rows for MoE. In addition, reverse the permutation map to help with
 // finalizing routing.
 
@@ -1345,7 +1388,7 @@ constexpr static int EXPAND_THREADS_PER_BLOCK = 256;
 
 template <class InputActivationsType, class ExpandedActivationsType,
           TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType,
-          bool PRE_QUANT_AWQ>
+          bool PRE_QUANT_AWQ, bool SCALES_ONLY = false>
 __global__ void expandInputRowsKernel(
     InputActivationsType const* unpermuted_input, ExpandedActivationsType* permuted_output,
     float const* unpermuted_scales, float* permuted_scales,
@@ -1464,7 +1507,9 @@ __global__ void expandInputRowsKernel(
           writeSF<VecSize, ELEM_PER_THREAD>(num_tokens_before_expert, expert, source_row,
                                             permuted_row, elem_index, padded_hidden_size,
                                             fc1_act_sf_flat, input_sf, swizzled_input_sf);
-          dest_row_ptr[elem_index] = in_vec;
+          if constexpr (!SCALES_ONLY) {
+            dest_row_ptr[elem_index] = in_vec;
+          }
         }
       }
 
@@ -1560,7 +1605,7 @@ void expandInputRowsKernelLauncher(
     bool use_per_expert_act_scale, int64_t* expert_first_token_offset,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, bool const swizzled_input_sf,
-    void const* prequant_scales, bool enable_pdl, cudaStream_t stream) {
+    void const* prequant_scales, bool enable_pdl, int const* unpermuted_row_to_permuted_row, int const* token_selected_experts, cudaStream_t stream) {
 #ifdef ENABLE_FP4
   TLLM_CHECK_WITH_INFO(
       (std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1> && fc1_act_sf_flat) ||
@@ -1638,12 +1683,40 @@ void expandInputRowsKernelLauncher(
   attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   config.numAttrs = 1;
   config.attrs = attrs;
+
+  
+  if constexpr (std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1> && std::is_same_v<InputActivationsType, __nv_fp4_e2m1>) {
+    if (hidden_size % 16 == 0 && hidden_size < EXPAND_THREADS_PER_BLOCK_NVFP4 * EXPAND_ELEMS_PER_THREAD_NVFP4) {
+
+      cudaLaunchKernelEx(&config, &expandInputRowsKernel<__nv_fp4_e2m1, __nv_fp4_e2m1, TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4, /*PRE_QUANT_AWQ=*/false, /*SCALES_ONLY=*/true>, unpermuted_input, permuted_output, unpermuted_scales,
+                         permuted_scales, permuted_row_to_unpermuted_row, num_rows, hidden_size, k,
+                         quant_params.fp4.fc1.act_global_scale, use_per_expert_act_scale,
+                         expert_first_token_offset, fc1_act_sf_flat, input_sf, swizzled_input_sf,
+                         num_experts_per_node,
+                         reinterpret_cast<InputActivationsType const*>(prequant_scales));
+
+      expandInputRowsKernel_nvfp4<<<num_rows, EXPAND_THREADS_PER_BLOCK_NVFP4, 0, stream>>>(
+        reinterpret_cast<uint64_t const*>(unpermuted_input),
+        reinterpret_cast<uint64_t*>(permuted_output),
+        unpermuted_row_to_permuted_row,
+        num_rows,
+        hidden_size,
+        k,
+        expert_first_token_offset,
+        token_selected_experts,
+        num_experts_per_node);
+
+      return;
+    }
+  }
+
+  
   cudaLaunchKernelEx(&config, func, unpermuted_input, permuted_output, unpermuted_scales,
-                     permuted_scales, permuted_row_to_unpermuted_row, num_rows, hidden_size, k,
-                     quant_params.fp4.fc1.act_global_scale, use_per_expert_act_scale,
-                     expert_first_token_offset, fc1_act_sf_flat, input_sf, swizzled_input_sf,
-                     num_experts_per_node,
-                     reinterpret_cast<InputActivationsType const*>(prequant_scales));
+                       permuted_scales, permuted_row_to_unpermuted_row, num_rows, hidden_size, k,
+                       quant_params.fp4.fc1.act_global_scale, use_per_expert_act_scale,
+                       expert_first_token_offset, fc1_act_sf_flat, input_sf, swizzled_input_sf,
+                       num_experts_per_node,
+                       reinterpret_cast<InputActivationsType const*>(prequant_scales));
 }
 
 #define INSTANTIATE_EXPAND_INPUT_ROWS(InputActivationsType, ExpandedActivationsType)               \
@@ -1656,7 +1729,7 @@ void expandInputRowsKernelLauncher(
       int64_t* expert_first_token_offset,                                                          \
       TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,                              \
       TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, bool const swizzled_input_sf, \
-      void const* prequant_scales, bool enable_pdl, cudaStream_t stream)
+      void const* prequant_scales, bool enable_pdl, int const* unpermuted_row_to_permuted_row, int const* token_selected_experts, cudaStream_t stream)
 
 // Instantiate the data types that are used by the external pytorch op
 // INSTANTIATE_EXPAND_INPUT_ROWS(float, float);
@@ -3792,7 +3865,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         experts_per_token, num_experts_per_node, quant_params, use_per_expert_act_scale,
         expert_first_token_offset_, fc1_fp4_act_scale_, input_sf, swizzled_input_sf,
         (use_w4afp8 && !use_fp8_input) ? quant_params.groupwise.fc1.act_scales : nullptr,
-        enable_pdl, stream);
+        enable_pdl, permuted_row_to_unpermuted_row_, token_selected_experts, stream);
     auto const* gemm1_input = gemm1_input_expand;
 
     sync_check_cuda_error(stream);

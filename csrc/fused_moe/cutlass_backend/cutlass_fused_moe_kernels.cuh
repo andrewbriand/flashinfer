@@ -1343,8 +1343,8 @@ constexpr int EXPAND_ELEMS_PER_THREAD_NVFP4 = 64;
 
 __global__ void expandInputRowsKernel_nvfp4(uint64_t const* __restrict__ unpermuted_input,
                                             uint64_t* __restrict__ permuted_output,
-                                            float const* unpermuted_scales,
-                                            float *permuted_scales,
+                                            float const* __restrict__ unpermuted_scales,
+                                            float * __restrict__ permuted_scales,
                                             int const *unpermuted_row_to_permuted_row,
                                             int64_t const num_tokens, int64_t const hidden_size, int64_t const experts_per_token, int64_t const * __restrict__ expert_first_token_offset, int const * __restrict__ token_selected_experts, int const num_experts_per_node,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
@@ -1359,7 +1359,10 @@ __global__ void expandInputRowsKernel_nvfp4(uint64_t const* __restrict__ unpermu
   constexpr int sf_per_thread = EXPAND_ELEMS_PER_THREAD_NVFP4 / 16;
 
   uint64_t inputs[inputs_per_thread];
-  uint8_t input_sfs[sf_per_thread];
+
+  static_assert(sf_per_thread == 4);
+  uint32_t input_sfs;
+  //uint8_t input_sfs[sf_per_thread];
   
 
   int input_row = blockIdx.x;
@@ -1381,9 +1384,10 @@ __global__ void expandInputRowsKernel_nvfp4(uint64_t const* __restrict__ unpermu
     }
   }
 
-  #pragma unroll
-  for (int k = 0; k < sf_per_thread; k++) {
-    int sf_linear = EXPAND_THREADS_PER_BLOCK_NVFP4 * k + threadIdx.x;
+  //#pragma unroll
+  //for (int k = 0; k < sf_per_thread; k++) {
+    //int sf_linear = EXPAND_THREADS_PER_BLOCK_NVFP4 * k + threadIdx.x;
+    int sf_linear = threadIdx.x * sf_per_thread;
     if (sf_linear * 16 < hidden_size) {
       int offset;
       if (swizzled_input_sf) {
@@ -1392,9 +1396,9 @@ __global__ void expandInputRowsKernel_nvfp4(uint64_t const* __restrict__ unpermu
         offset = input_row * hidden_size / 16 + sf_linear;
       }
 
-      input_sfs[k] = input_sf[offset];
+      input_sfs = *(uint32_t*)(&input_sf[offset]);
     }
-  }
+  //}
 
 
   for (int i = 0; i < experts_per_token; i++) {
@@ -1412,9 +1416,9 @@ __global__ void expandInputRowsKernel_nvfp4(uint64_t const* __restrict__ unpermu
         }
       }
 
-      #pragma unroll
-      for (int k = 0; k < sf_per_thread; k++) {
-        int sf_linear = EXPAND_THREADS_PER_BLOCK_NVFP4 * k + threadIdx.x;
+     // #pragma unroll
+      //for (int k = 0; k < sf_per_thread; k++) {
+        int sf_linear = threadIdx.x * sf_per_thread;
         if (sf_linear * 16 < hidden_size) {
           int num_tokens_before_expert = expert_first_token_offset[target_expert];
           int act_sf_expert = getOffsetActivationSF(target_expert, num_tokens_before_expert, hidden_size,
@@ -1427,9 +1431,10 @@ __global__ void expandInputRowsKernel_nvfp4(uint64_t const* __restrict__ unpermu
           //printf("threadIdx.x: %i input_row: %i, target_expert: %i output_row: %i, output_offset: %i, fc1_act_sf_flat: %i, input_sfs: %i, linear_sf: %i, num_tokens_before_expert: %i\n",
              //       threadIdx.x, input_row, target_expert, output_row, output_offset, (int)fc1_act_sf_flat[output_offset], (int)input_sfs[k], sf_linear, num_tokens_before_expert);
           //}
-          fc1_act_sf_flat[output_offset] = input_sfs[k];
+          //fc1_act_sf_flat[output_offset] = input_sfs[k];
+          *(uint32_t*)(&fc1_act_sf_flat[output_offset]) = input_sfs;
         }
-      }
+      //}
 
       if (permuted_scales && threadIdx.x == 0) {
         permuted_scales[output_row] = unpermuted_scales ? unpermuted_scales[input_row * experts_per_token + i] : 1.0f;
